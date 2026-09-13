@@ -1,0 +1,99 @@
+# ping -- manifest.pdxsig
+#
+# Dual-signed package manifest for `ping` v0.5.0.
+#
+# Format: mirrors tools/user/cat/manifest.pdxsig and
+# tools/user/pdxsock/release/manifest.pdxsig.txt in the paideia-os
+# monorepo -- the text-review-friendly source-form; `paideia-as
+# release --sign` is the tool that produces the on-wire binary-encoded
+# manifest.pdxsig alongside pkg.tar.
+#
+# Substrate posture: the runtime prerequisites for producing REAL
+# cryptographic signatures + REAL sha3-256 content hashes are not
+# landed at HEAD (ml_dsa_65_{sign,verify} + sha3_256 intrinsics,
+# svc.signing-bot broker registration, pkgs.paideia-os host -- all
+# tracked in the paideia-os meta repo). Every signature and hash slot
+# below carries a documented placeholder.
+
+# ---------------------------------------------------------------
+# §1 Package identity
+# ---------------------------------------------------------------
+package:
+  name:              ping
+  version:           0.5.0
+  wave:              R100 (paideia-os design/networking/r100-user-tools-plan.md)
+  category:          C  # Networking user tools
+  posix_ancestor:    ping (floor-scope; see paideia-os/pdxping for the full-featured sibling)
+  release_date:      2026-09-13
+  git_tag:           v0.5.0
+  git_repo:          github.com/paideia-os/ping
+  license:           MIT
+  paideia_as_target: v0.36.0
+
+# ---------------------------------------------------------------
+# §2 Capability manifest reference (I6)
+# ---------------------------------------------------------------
+caps_decl:
+  path:              caps.decl
+  hash_sha2_256:     TBD-RECOMPUTED-AT-SIGN
+  # hash_sha3_256:  <re-emitted by paideia-as release --sign>
+
+# ---------------------------------------------------------------
+# §3 Dependency manifest reference
+# ---------------------------------------------------------------
+deps_list:
+  path:              (none)
+  # v0.5.0 has zero cross-repo dependencies: DNS resolve and ICMP
+  # echo are both honest WEAK stubs (see src/main.pdx header + README)
+  # that never call libpdx-net.net_resolve or the kernel's real
+  # sys_icmp_echo.
+
+# ---------------------------------------------------------------
+# §4 Content hashes over the shipped tree
+# ---------------------------------------------------------------
+content_hashes:
+  algorithm:         sha2-256          # interim; on-wire uses sha3-256
+  entries:
+    - path: LICENSE
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: caps.decl
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/main.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+
+# ---------------------------------------------------------------
+# §5 Declared output schemas
+# ---------------------------------------------------------------
+declared_output_schemas:
+  - name:            (none)
+  # v0.5.0 writes plain "reply from <ip> rtt=<n>ms" lines to fd 1; no
+  # semantic-pipe / typed-record emission at this milestone.
+
+# ---------------------------------------------------------------
+# §6 Author signature -- first of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+author_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia-os-team
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+
+# ---------------------------------------------------------------
+# §7 Root re-signature -- second of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+root_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia_root_pk
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+  countersigned_by:  svc.signing-bot
+  countersigner_note: pending
+
+# ---------------------------------------------------------------
+# §8 Substrate-gate refusal witness
+# ---------------------------------------------------------------
+# `pkg install ping` from this manifest MUST refuse until BOTH
+# signature blocks carry non-PENDING bytes. Refusal exit code is 4
+# (cap denied per caps-decl-format.md I4) -- the missing cap here is
+# the implicit KIND_SIGNATURE(verify, *) placeholder bytes cannot
+# satisfy.

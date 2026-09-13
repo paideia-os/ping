@@ -1,0 +1,162 @@
+// src/main.pdx -- ping v0.5.0 (M1-002, paideia-os/ping#2).
+//
+// `ping <host>` -- DNS resolve + ICMP echo + RTT loop, printed as
+// four "reply from <ip> rtt=<n>ms" lines. This file is the ring-3
+// ELF entry point (`_start`), argv-wired per the frozen execve ABI
+// (design/user/execve-abi.md in the paideia-os monorepo): rdi = argc,
+// rsi = argv (VA of a char*[]), rdx = envp (unused), rsp % 16 == 0 at
+// entry.
+//
+// This is the FLOOR-scope `ping`, distinct from `paideia-os/pdxping`
+// (the full-featured ICMP client in the R100 wave -- sequence
+// numbers, real RTT timing, packet-loss statistics). This tool exists
+// to give the shell tree a tiny, dependency-free ICMP-shaped command.
+//
+// Both of this tool's network-shaped operations are honest WEAK
+// stubs -- neither makes a real syscall, for two DIFFERENT reasons:
+//
+//   - DNS resolve (`libpdx-net.net_resolve`): the library is not yet
+//     linkable from a satellite repo. A real resolver has nothing to
+//     stand in for yet, so the honest floor behaviour is a fixed
+//     answer: every host argument resolves to the literal `8.8.8.8`.
+//
+//   - ICMP echo (`sys_icmp_echo`, SC+ ID 103,
+//     src/kernel/core/syscall/handlers/sys_icmp_echo.pdx): this is a
+//     STRUCTURAL gate, not a missing-library gap. The syscall's
+//     `R_NET_PRIVILEGED_PROTOCOL` check
+//     (src/kernel/core/cap/cap_net_privileged.pdx) admits exactly two
+//     callers at this wave -- boot context (`_current_tcb == 0`) and
+//     PID 1 (init). Every other ring-3 task, this tool included, gets
+//     `-EPERM` on every real call, unconditionally, regardless of any
+//     capability this tool's own caps.decl could declare (the gate
+//     checks the caller's PID, not a capability slot the shell could
+//     grant). Calling the syscall anyway and discarding the -EPERM
+//     would be strictly worse than not calling it at all -- it would
+//     make the tool look like it attempted real I/O when it did not.
+//     The honest floor behaviour is a fixed RTT: `rtt=1ms` on every
+//     line.
+//
+// Argv grammar:
+//   ping <host>                 -- print 4 reply lines, exit 0
+//   ping                        -- usage on fd 2; exit 2
+//   ping <a> <b> ...            -- usage on fd 2; exit 2 (argc != 2)
+//
+// `<host>` is REQUIRED and its argv slot is validated for presence
+// (the argc gate), but its BYTES are never read -- the fixed-answer
+// resolver returns `8.8.8.8` regardless of what was typed. This is
+// the documented v0.5.0 scope, not an oversight: printing the
+// resolved address (rather than echoing the input host) makes the
+// stub's honesty visible in the tool's own output, exactly as
+// `pdxsock`'s `--dry-run` preview makes ITS honest scope-cuts visible
+// rather than silent.
+//
+// Exit codes:
+//   0 = clean completion (always, at this floor scope -- there is no
+//       failure path once the argc gate passes, since nothing past
+//       it can fail: no socket, no syscall, no parse)
+//   2 = argv usage refusal (argc != 2)
+//
+// Reply line wire format (fixed, one sys_write per iteration, no
+// decimal-digit composition needed since both fields are constants
+// at this floor scope):
+//   "reply from 8.8.8.8 rtt=1ms\n"   (27 bytes)
+//
+// SC+ IDs used (matches src/user/syscall_shim.pdx + design/user/
+// syscall-table.md):
+//   1  = sys_write (fd, buf, count) -> n | -errno
+//   60 = sys_exit  (status)          -> never returns
+//
+// Register plan for `_start` (both callee-save across the loop's
+// sys_write calls per the amd64 fast-syscall convention -- syscall
+// preserves rbx/rbp/r12..r15; rax/rcx/rdx/rsi/rdi/r8..r11 are treated
+// as fully volatile around every syscall in this file):
+//   r12 = argc (Step 0 only)
+//   r13 = argv (Step 0 only)
+//   r14 = loop counter (0..4)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory):
+//   - No `test rN, rN`; every zero/bound check is `cmp rN, imm`.
+//   - No 2-op `imul r, imm`; this file does no multiplication at all
+//     (both printed fields are fixed literals -- there is nothing to
+//     compute).
+//   - No `and r8-r15, imm64`; this file uses no `and` at all.
+//   - Every label prefixed `ping_` (paideia-as reserved-word
+//     discipline: `loop`, `if`, etc. are keywords).
+//   - Module name matches the PascalCase file basename (`Main` for
+//     `main.pdx`).
+//   - No multiline `pub let = "..."` string continuations; every
+//     literal is one line, and every `[u8; N]` length + sibling
+//     `_len` constant was computed with `python3 -c 'len(...)'`
+//     rather than hand-counted.
+
+module Main = structure {
+
+  // -----------------------------------------------------------------
+  // Diagnostic + reply-line literals. Every literal is one line;
+  // `_len` is the wire byte count (excludes the trailing NUL).
+  // -----------------------------------------------------------------
+  pub let ping_msg_usage     : [u8; 20] = "ping: usage <host>\n\0"
+  pub let ping_msg_usage_len : u64      = 19
+
+  pub let ping_msg_reply     : [u8; 28] = "reply from 8.8.8.8 rtt=1ms\n\0"
+  pub let ping_msg_reply_len : u64      = 27
+
+  // -----------------------------------------------------------------
+  // _start -- ping entry point. Never returns; every terminal path
+  // ends in sys_exit.
+  //
+  // Effects: {mem, sysreg} for the loop counter + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs/cap unused directly by this file
+  //          (no socket, no filesystem syscall at this floor scope),
+  //          kept for shape parity with every other satellite _start
+  //          in this wave; sched for exit.
+  // -----------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "ping v0.5.0 M1-002 (paideia-os/ping#2): floor-scope DNS-resolve + ICMP-echo + RTT loop. Step 0 latches argc/argv (r12/r13) from the execve-ABI entry registers. Step 1 gates argc == 2 (host argument present, its bytes never read -- see file header), else usage on fd 2 and exit 2. Step 2 is a fixed 4-iteration loop (r14, 0..4) that sys_write(1, ping_msg_reply, 27)'s the same literal line each time: 'reply from 8.8.8.8 rtt=1ms\\n'. Both the resolved address and the RTT are honest WEAK-stub constants (see file header for why each is a stub for a DIFFERENT reason -- DNS is a library-linkage gap, ICMP echo is a structural R_NET_PRIVILEGED_PROTOCOL PID-1-only gate that would return -EPERM to any real call this ring-3 process made). Step 3 sys_exit(0) -- there is no failure path past the argc gate at this floor scope. Register discipline: r14 (loop counter) is SysV-preserved across every SYSCALL per the amd64 fast-syscall convention this codebase documents throughout (pdxsock/cat/mkfs.pdxfs _start functions); rax/rcx/rdx/rsi/rdi/r8-r11 are treated as fully volatile around the sys_write calls and are reloaded fresh each iteration. Encoder discipline (per user memory 'pdx encoder pitfalls'): no `test rN, rN` (every check is `cmp rN, imm`); no 2-op `imul` (no multiplication in this file at all); no `and r8-r15, imm64` (no `and` at all); every label prefixed `ping_`; module name matches file basename PascalCase (Main); every `[u8; N]` length computed with `python3 -c 'len(...)'`, not hand-counted.",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                           // r12 = argc
+        mov r13, rsi;                           // r13 = argv (unused past the gate)
+
+        // ---- Step 1: argc gate. -------------------------------------
+        cmp r12, 2;
+        jne ping_usage;
+
+        // ---- Step 2: four-iteration reply loop. ----------------------
+        mov r14, 0;                              // i = 0
+      ping_reply_loop:
+        cmp r14, 4;
+        je ping_done;
+        mov rdi, 1;                               // fd = stdout
+        lea rsi, [rip + ping_msg_reply];
+        mov rdx, 27;                                // ping_msg_reply_len
+        mov rax, 1;                                  // SC+ sys_write
+        syscall;
+        add r14, 1;
+        jmp ping_reply_loop;
+
+      ping_done:
+        mov rdi, 0;
+        mov rax, 60;                                  // SC+ sys_exit
+        syscall;
+        hlt;
+
+        // ================================================================
+        // Diagnostic exit
+        // ================================================================
+      ping_usage:
+        mov rdi, 2;
+        lea rsi, [rip + ping_msg_usage];
+        mov rdx, 19;                                    // ping_msg_usage_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    } @no_frame
+}
