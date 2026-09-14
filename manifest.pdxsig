@@ -1,6 +1,6 @@
 # ping -- manifest.pdxsig
 #
-# Dual-signed package manifest for `ping` v0.5.0.
+# Dual-signed package manifest for `ping` v1.0.0.
 #
 # Format: mirrors tools/user/cat/manifest.pdxsig and
 # tools/user/pdxsock/release/manifest.pdxsig.txt in the paideia-os
@@ -20,12 +20,12 @@
 # ---------------------------------------------------------------
 package:
   name:              ping
-  version:           0.5.0
-  wave:              R100 (paideia-os design/networking/r100-user-tools-plan.md)
+  version:           1.0.0
+  wave:              Wave mu-04 (paideia-os design/networking/r100-user-tools-plan.md)
   category:          C  # Networking user tools
   posix_ancestor:    ping (floor-scope; see paideia-os/pdxping for the full-featured sibling)
-  release_date:      2026-09-13
-  git_tag:           v0.5.0
+  release_date:      2026-09-14
+  git_tag:           v1.0.0
   git_repo:          github.com/paideia-os/ping
   license:           MIT
   paideia_as_target: v0.36.0

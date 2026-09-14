@@ -3,6 +3,35 @@
 All notable changes to `ping` are recorded here. Format: keep-a-
 changelog-style, semver-ordered, newest first.
 
+## [1.0.0] - 2026-09-14 - Wave mu-04: real ICMP echo (ping#3)
+
+### Changed
+- **Real `sys_icmp_echo` (SC+ 103) call, replacing the v0.5.0 fixed
+  `rtt=1ms` WEAK stub.** Each of the four attempts now: builds a real
+  4-byte dst IPv4 buffer + an 8-byte payload, brackets a real
+  `sys_icmp_echo` call with two real `sys_clock_read_ns` (SC+ 66)
+  reads, and reports the outcome honestly:
+  - success (kernel returned a real `rtt_ns`): `reply from 8.8.8.8
+    rtt=<ms>ms` on fd 1, `<ms>` a genuine runtime `div`-by-1000000
+    conversion.
+  - `-EPERM` (the syscall's `R_NET_PRIVILEGED_PROTOCOL` gate admits
+    only boot context / PID 1 -- this ring-3 process is neither, so
+    this is the expected outcome on every real system today): `ping:
+    icmp echo denied (EPERM) attempt_ns=<n>` on fd 2, `<n>` the real
+    ping-side wall-clock bracket of the actual attempt.
+  - `-EINVAL`: a defensive, symmetrically-handled branch (this tool's
+    own argument construction never triggers it).
+- DNS resolution is unchanged: still a fixed `8.8.8.8` WEAK stub, for
+  the unrelated reason that `libpdx-net.net_resolve` is not yet
+  linkable from a satellite repo.
+
+### Known gaps
+- `sys_icmp_echo`'s kernel-side admission gate means this binary's
+  real call is expected to return `-EPERM` on every deployment until a
+  future round widens that gate or grants ring-3 callers a real
+  per-task ICMP capability -- no code change needed in this repo when
+  that happens, since the real call + argument shape already exist.
+
 ## [0.5.0] - 2026-09-13
 
 First tagged release. Closes ping#1 (M1-001 repo bootstrap) and

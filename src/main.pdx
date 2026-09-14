@@ -1,84 +1,142 @@
-// src/main.pdx -- ping v0.5.0 (M1-002, paideia-os/ping#2).
+// src/main.pdx -- ping v1.0.0 (Wave mu-04, paideia-os/ping#3).
 //
-// `ping <host>` -- DNS resolve + ICMP echo + RTT loop, printed as
-// four "reply from <ip> rtt=<n>ms" lines. This file is the ring-3
-// ELF entry point (`_start`), argv-wired per the frozen execve ABI
-// (design/user/execve-abi.md in the paideia-os monorepo): rdi = argc,
-// rsi = argv (VA of a char*[]), rdx = envp (unused), rsp % 16 == 0 at
-// entry.
+// `ping <host>` -- ICMP echo + RTT loop, printed as up-to-four
+// per-attempt lines. This file is the ring-3 ELF entry point
+// (`_start`), argv-wired per the frozen execve ABI (design/user/
+// execve-abi.md in the paideia-os monorepo): rdi = argc, rsi = argv
+// (VA of a char*[]), rdx = envp (unused), rsp % 16 == 0 at entry.
 //
-// This is the FLOOR-scope `ping`, distinct from `paideia-os/pdxping`
-// (the full-featured ICMP client in the R100 wave -- sequence
-// numbers, real RTT timing, packet-loss statistics). This tool exists
-// to give the shell tree a tiny, dependency-free ICMP-shaped command.
+// v1.0.0 replaces the v0.5.0 fixed-RTT WEAK stub with a REAL
+// `sys_icmp_echo` call (SC+ ID 103,
+// src/kernel/core/syscall/handlers/sys_icmp_echo.pdx) bracketed by
+// REAL `sys_clock_read_ns` reads (SC+ ID 66) on the ping side, per
+// Wave mu's "floor-only if kernel gap" instruction. Two DIFFERENT WEAK
+// gaps remain, for two DIFFERENT reasons, both honestly reported per
+// attempt rather than papered over:
 //
-// Both of this tool's network-shaped operations are honest WEAK
-// stubs -- neither makes a real syscall, for two DIFFERENT reasons:
+//   - DNS resolve (`libpdx-net.net_resolve`): still not linkable from
+//     a satellite repo (unchanged from v0.5.0). Every host argument
+//     resolves to the literal `8.8.8.8`; its bytes are packed into
+//     `ping_dst_ip` at runtime (four `mov_b` stores of the literal
+//     value 8) rather than embedded as a raw-byte string literal, to
+//     keep the source text printable/diffable.
 //
-//   - DNS resolve (`libpdx-net.net_resolve`): the library is not yet
-//     linkable from a satellite repo. A real resolver has nothing to
-//     stand in for yet, so the honest floor behaviour is a fixed
-//     answer: every host argument resolves to the literal `8.8.8.8`.
+//   - ICMP echo (`sys_icmp_echo`): this call is now REAL and REAL
+//     network-shaped (dst_addr_ptr + a real 8-byte payload + seq
+//     bumped per attempt), but the syscall's OWN
+//     `R_NET_PRIVILEGED_PROTOCOL` gate (src/kernel/core/cap/
+//     cap_net_privileged.pdx) admits exactly two callers -- boot
+//     context (`_current_tcb == 0`) and PID 1 (init). This ring-3
+//     `ping` process is neither, so every real call in this v1.0.0
+//     binary is expected to observe `-EPERM` (the all-ones u64
+//     sentinel) on every real system this tool runs on today. This is
+//     the SAME "ships anyway, named as a known gap" posture
+//     `pdxcurl`'s TLS handshake branch documents for its own
+//     currently-unreachable code path (tls_wire.pdx's WEAK-passthrough
+//     note): the real call, the real argument marshalling, and the
+//     real failure-branch handling all exist and are exercised: only
+//     the kernel-side admission gate stands between this code and a
+//     genuine off-box ICMP round trip. When a future round widens
+//     `cap_net_privileged.pdx`'s admission set (or the dispatch shim
+//     grows a KPTI bounce + a capability grant path for ring-3
+//     callers), this binary needs NO changes -- it already calls the
+//     real syscall with the real argument shape.
 //
-//   - ICMP echo (`sys_icmp_echo`, SC+ ID 103,
-//     src/kernel/core/syscall/handlers/sys_icmp_echo.pdx): this is a
-//     STRUCTURAL gate, not a missing-library gap. The syscall's
-//     `R_NET_PRIVILEGED_PROTOCOL` check
-//     (src/kernel/core/cap/cap_net_privileged.pdx) admits exactly two
-//     callers at this wave -- boot context (`_current_tcb == 0`) and
-//     PID 1 (init). Every other ring-3 task, this tool included, gets
-//     `-EPERM` on every real call, unconditionally, regardless of any
-//     capability this tool's own caps.decl could declare (the gate
-//     checks the caller's PID, not a capability slot the shell could
-//     grant). Calling the syscall anyway and discarding the -EPERM
-//     would be strictly worse than not calling it at all -- it would
-//     make the tool look like it attempted real I/O when it did not.
-//     The honest floor behaviour is a fixed RTT: `rtt=1ms` on every
-//     line.
+//   `sys_icmp_echo`'s own -EINVAL path is also handled honestly (a
+//   distinct diagnostic line) even though this tool's own argument
+//   construction (non-null dst_addr_ptr, payload_len=8<=256,
+//   non-null payload_ptr) never triggers it -- a defensive branch
+//   rather than an unreachable-and-silently-dropped case.
 //
 // Argv grammar:
-//   ping <host>                 -- print 4 reply lines, exit 0
+//   ping <host>                 -- up to 4 per-attempt lines, exit 0
 //   ping                        -- usage on fd 2; exit 2
 //   ping <a> <b> ...            -- usage on fd 2; exit 2 (argc != 2)
 //
 // `<host>` is REQUIRED and its argv slot is validated for presence
 // (the argc gate), but its BYTES are never read -- the fixed-answer
-// resolver returns `8.8.8.8` regardless of what was typed. This is
-// the documented v0.5.0 scope, not an oversight: printing the
-// resolved address (rather than echoing the input host) makes the
-// stub's honesty visible in the tool's own output, exactly as
-// `pdxsock`'s `--dry-run` preview makes ITS honest scope-cuts visible
-// rather than silent.
+// resolver returns `8.8.8.8` regardless of what was typed (see file
+// header DNS note above; unchanged v0.5.0 scope).
 //
 // Exit codes:
-//   0 = clean completion (always, at this floor scope -- there is no
-//       failure path once the argc gate passes, since nothing past
-//       it can fail: no socket, no syscall, no parse)
+//   0 = clean completion (always, at this floor scope -- an -EPERM or
+//       -EINVAL from sys_icmp_echo is a reported OUTCOME per attempt,
+//       not a usage error of this tool)
 //   2 = argv usage refusal (argc != 2)
 //
-// Reply line wire format (fixed, one sys_write per iteration, no
-// decimal-digit composition needed since both fields are constants
-// at this floor scope):
-//   "reply from 8.8.8.8 rtt=1ms\n"   (27 bytes)
+// Per-attempt line shapes (one sys_write chain per line; the decimal
+// value is a REAL runtime conversion, not a fixed literal, using the
+// proven div-by-10 shape from tools/user/mount.pdxfs/src/
+// mount_record.pdx's `mount_record_print_decimal`):
+//   success:  "reply from 8.8.8.8 rtt=<ms>ms\n"           (fd 1)
+//             <ms> = sys_icmp_echo's own rtt_ns / 1_000_000 (a single
+//             `div` by the compile-time constant 1000000 -- not the
+//             banned `imul`, matching `div`'s already-proven use in
+//             this codebase).
+//   -EPERM:   "ping: icmp echo denied (EPERM) attempt_ns=<n>\n" (fd 2)
+//             <n> = the ping-side sys_clock_read_ns bracket around the
+//             whole sys_icmp_echo call (real wall time of the actual
+//             attempt, even though the kernel refused to touch the
+//             network stack).
+//   -EINVAL:  "ping: icmp echo einval attempt_ns=<n>\n"    (fd 2)
 //
 // SC+ IDs used (matches src/user/syscall_shim.pdx + design/user/
 // syscall-table.md):
-//   1  = sys_write (fd, buf, count) -> n | -errno
-//   60 = sys_exit  (status)          -> never returns
+//   1   = sys_write      (fd, buf, count)                    -> n | -errno
+//   60  = sys_exit       (status)                             -> never returns
+//   66  = sys_clock_read_ns ()                                -> u64 ns since boot
+//   103 = sys_icmp_echo  (dst_addr_ptr, seq, payload_ptr,
+//                         payload_len, timeout_ms)             -> rtt_ns | -EPERM | -EINVAL
 //
-// Register plan for `_start` (both callee-save across the loop's
-// sys_write calls per the amd64 fast-syscall convention -- syscall
-// preserves rbx/rbp/r12..r15; rax/rcx/rdx/rsi/rdi/r8..r11 are treated
-// as fully volatile around every syscall in this file):
-//   r12 = argc (Step 0 only)
-//   r13 = argv (Step 0 only)
-//   r14 = loop counter (0..4)
+// Register plan for `_start` (STRICT discipline: a value that must
+// survive a `syscall` lives ONLY in rbx/rbp/r12..r15, the six
+// SysV-preserved-across-SYSCALL registers this codebase's fast-syscall
+// convention documents everywhere; rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11
+// are treated as fully volatile around every syscall and NEVER carry
+// a live value across one in this file):
+//   rbx = &ping_dst_ip (constant for the whole run, built once before
+//         the loop; read again at the top of every iteration)
+//   r14 = attempt index (0..4; the ONE register live across the
+//         entire outer loop)
+//   Within one iteration, before the branch on sys_icmp_echo's result:
+//     r12 = t1 (sys_clock_read_ns #1), dead after step 4 below
+//     r13 = sys_icmp_echo's raw return value, dead after the branch
+//     rbp = t2 (sys_clock_read_ns #2), dead after step 4 below
+//     r15 = attempt_ns = t2 - t1 (computed from r12/rbp while both are
+//           still live; the ONLY value carried out of this phase into
+//           the branch phase besides r13 itself)
+//   Within the branch/emit phase (r12/r13/rbp free again -- t1/t2/the
+//   raw icmp result are all consumed by this point):
+//     r13 = output fd (1 or 2) for every sys_write in this iteration
+//     r12 = suffix tag (1 = "ms\n", else bare "\n")
+//     r15 = the decimal value to print (either overwritten with
+//           rtt_ms on the success path, or left as attempt_ns on the
+//           -EPERM/-EINVAL paths)
+//   rax/rcx/rdx/rsi/rdi/r8/r9/r10 are freely reused as pure
+//   syscall-argument / div-loop scratch within a single syscall-free
+//   stretch and are never read again after crossing a `syscall`.
+//
+// No push/pop anywhere in this file: every register that must survive
+// a `syscall` is callee-save per the fast-syscall convention above,
+// and this file makes no nested `call` (every cross-cutting need is
+// inlined), so no callee-save prologue/epilogue or 16-byte call-site
+// padding is ever needed.
 //
 // Encoder discipline (paideia-as 0.36+ pitfalls, per user memory):
-//   - No `test rN, rN`; every zero/bound check is `cmp rN, imm`.
-//   - No 2-op `imul r, imm`; this file does no multiplication at all
-//     (both printed fields are fixed literals -- there is nothing to
-//     compute).
+//   - No `test rN, rN` anywhere; every zero-check is `cmp rN, 0`.
+//   - No 2-op `imul r, imm`; the only multiplication-adjacent op in
+//     this file is `div` by the compile-time constants 10 and
+//     1000000 (both proven safe -- `div` is not `imul`).
+//   - The two -errno sentinels (-EPERM = -1, -EINVAL = -22) are
+//     computed via `xor r9, r9; sub r9, 1` / `xor r9, r9; sub r9, 22`
+//     (matching
+//     `pdxcurl`'s `tlsw_pc_bad` "xor rax,rax; sub rax,1" idiom) and
+//     compared register-to-register, rather than risking a 64-bit
+//     immediate `cmp` encoding.
+//   - Byte stores via `mov_b [ptr], reg` (store side is unaffected by
+//     paideia-as #1248, which is load-side only; proven at
+//     tools/user/mount.pdxfs/src/passphrase_wire.pdx and
+//     tools/user/rm/src/resolve.pdx).
 //   - No `and r8-r15, imm64`; this file uses no `and` at all.
 //   - Every label prefixed `ping_` (paideia-as reserved-word
 //     discipline: `loop`, `if`, etc. are keywords).
@@ -92,30 +150,53 @@
 module Main = structure {
 
   // -----------------------------------------------------------------
-  // Diagnostic + reply-line literals. Every literal is one line;
-  // `_len` is the wire byte count (excludes the trailing NUL).
+  // .bss scratch: the 4-byte dst IPv4 address (built at runtime, see
+  // file header), the 8-byte ICMP echo payload buffer contents (a
+  // printable literal, unlike ping_dst_ip), and a 24-byte decimal
+  // staging buffer reused by every per-attempt number-emit.
   // -----------------------------------------------------------------
-  pub let ping_msg_usage     : [u8; 20] = "ping: usage <host>\n\0"
-  pub let ping_msg_usage_len : u64      = 19
+  pub let mut ping_dst_ip      : [u8; 4]  = uninit @align(8)
+  pub let ping_payload         : [u8; 9]  = "PING0001\0"
+  pub let ping_payload_len     : u64      = 8
+  pub let mut ping_num_scratch : [u8; 24] = uninit @align(8)
 
-  pub let ping_msg_reply     : [u8; 28] = "reply from 8.8.8.8 rtt=1ms\n\0"
-  pub let ping_msg_reply_len : u64      = 27
+  // -----------------------------------------------------------------
+  // Diagnostic / reply literals. Every literal is one line; `_len` is
+  // the wire byte count (excludes the trailing NUL in the array).
+  // -----------------------------------------------------------------
+  pub let ping_msg_usage        : [u8; 20] = "ping: usage <host>\n\0"
+  pub let ping_msg_usage_len    : u64      = 19
+
+  pub let ping_lit_reply_prefix : [u8; 24] = "reply from 8.8.8.8 rtt=\0"
+  pub let ping_lit_reply_prefix_len : u64  = 23
+
+  pub let ping_lit_reply_suffix : [u8; 4]  = "ms\n\0"
+  pub let ping_lit_reply_suffix_len : u64  = 3
+
+  pub let ping_lit_eperm_prefix : [u8; 43] = "ping: icmp echo denied (EPERM) attempt_ns=\0"
+  pub let ping_lit_eperm_prefix_len : u64  = 42
+
+  pub let ping_lit_einval_prefix : [u8; 35] = "ping: icmp echo einval attempt_ns=\0"
+  pub let ping_lit_einval_prefix_len : u64  = 34
+
+  pub let ping_lit_nl            : [u8; 2]  = "\n\0"
+  pub let ping_lit_nl_len        : u64      = 1
 
   // -----------------------------------------------------------------
   // _start -- ping entry point. Never returns; every terminal path
   // ends in sys_exit.
   //
-  // Effects: {mem, sysreg} for the loop counter + every SYSCALL.
-  // Caps:    @{fs, sched, cap} -- fs/cap unused directly by this file
-  //          (no socket, no filesystem syscall at this floor scope),
-  //          kept for shape parity with every other satellite _start
-  //          in this wave; sched for exit.
+  // Effects: {mem, sysreg} for scratch touches + every SYSCALL.
+  // Caps:    @{fs, sched, cap} -- fs unused directly (no filesystem
+  //          syscall); sched for exit; cap for the icmp-echo syscall
+  //          family (kernel-side gated per
+  //          src/kernel/core/cap/cap_net_privileged.pdx).
   // -----------------------------------------------------------------
   pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched, cap},
-      justification: "ping v0.5.0 M1-002 (paideia-os/ping#2): floor-scope DNS-resolve + ICMP-echo + RTT loop. Step 0 latches argc/argv (r12/r13) from the execve-ABI entry registers. Step 1 gates argc == 2 (host argument present, its bytes never read -- see file header), else usage on fd 2 and exit 2. Step 2 is a fixed 4-iteration loop (r14, 0..4) that sys_write(1, ping_msg_reply, 27)'s the same literal line each time: 'reply from 8.8.8.8 rtt=1ms\\n'. Both the resolved address and the RTT are honest WEAK-stub constants (see file header for why each is a stub for a DIFFERENT reason -- DNS is a library-linkage gap, ICMP echo is a structural R_NET_PRIVILEGED_PROTOCOL PID-1-only gate that would return -EPERM to any real call this ring-3 process made). Step 3 sys_exit(0) -- there is no failure path past the argc gate at this floor scope. Register discipline: r14 (loop counter) is SysV-preserved across every SYSCALL per the amd64 fast-syscall convention this codebase documents throughout (pdxsock/cat/mkfs.pdxfs _start functions); rax/rcx/rdx/rsi/rdi/r8-r11 are treated as fully volatile around the sys_write calls and are reloaded fresh each iteration. Encoder discipline (per user memory 'pdx encoder pitfalls'): no `test rN, rN` (every check is `cmp rN, imm`); no 2-op `imul` (no multiplication in this file at all); no `and r8-r15, imm64` (no `and` at all); every label prefixed `ping_`; module name matches file basename PascalCase (Main); every `[u8; N]` length computed with `python3 -c 'len(...)'`, not hand-counted.",
+      justification: "ping v1.0.0 (Wave mu-04, paideia-os/ping#3): real ICMP-echo + RTT loop. Step 0 latches argc/argv (r12/r13). Step 1 gates argc == 2, else usage/exit 2. Step 2 builds ping_dst_ip = [8,8,8,8] via four mov_b stores (the fixed-answer DNS stub, unchanged reason from v0.5.0 -- see file header) and latches its address into rbx for the whole run. Step 3 is a 4-iteration loop (r14, 0..4): each iteration reads sys_clock_read_ns (SC+66) into r12 as t1, calls sys_icmp_echo (SC+103) with dst_addr_ptr=rbx, seq=r14+1, payload_ptr=&ping_payload, payload_len=8, timeout_ms=1000 (accepted-but-unused by the kernel at this landing, passed anyway for ABI completeness), stashes the raw return in r13, reads sys_clock_read_ns again into rbp as t2, and computes the ping-side bracket attempt_ns = t2 - t1 into r15 while r12/rbp are still live. Branch on r13 against the two -errno sentinels (computed via xor r9,r9; sub r9,1 / xor r9,r9; sub r9,22 rather than a risky imm64 cmp): a match on -EPERM or -EINVAL re-purposes r13 as the output fd (2), r12 as a suffix-tag (2 = bare newline), and keeps r15 = attempt_ns as the value to print (the real ping-side wall-clock bracket, since the kernel refused to produce a real rtt_ns); anything else is treated as a real success, re-purposes r13=fd(1)/r12=tag(1='ms\\n'), and overwrites r15 with rtt_ns/1000000 (a single div-by-1000000 -- a proven-safe `div`, not the banned `imul`) computed from the OLD r13 value before r13 is repurposed. Every branch then sets rsi/rdx to the chosen prefix literal's (ptr,len) and falls into the shared ping_emit_prefix/ping_emit_number/ping_emit_suffix tail, which sys_writes the prefix (fd=r13), then the decimal value (a straight port of tools/user/mount.pdxfs/src/mount_record.pdx's mount_record_print_decimal div-by-10 loop, staged into ping_num_scratch; the loop's own scratch (r8/r9/r10/rax/rcx/rdx) is pure volatile-register/no-syscall-in-between arithmetic, safe under this file's syscall-clobber discipline), then the suffix (selected by r12's tag). Step 4 sys_exit(0) after all 4 iterations -- an -EPERM/-EINVAL outcome is a reported per-attempt result, not a tool-level usage failure, at this floor scope (see file header). STRICT register discipline: the ONLY registers ever live across a `syscall` boundary anywhere in this file are rbx/rbp/r12/r13/r14/r15 (and rbp/r12/r13 only within the narrow t1/t2/icmp-result window described above, never simultaneously with their later branch-phase repurposing); rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11 are reloaded fresh for every syscall's arguments and never read after a syscall without being explicitly reloaded first -- this is a correction relative to an earlier draft of this file that mistakenly tried to carry the print-fd/suffix-tag/value trio through r9/r10/r11 across the emit tail's THREE sys_write calls, which this codebase's own documented fast-syscall convention (r8..r11 fully volatile around every syscall) forbids. No push/pop anywhere (no nested CALL in this file, so no callee-save prologue or 16-byte call-site padding is ever needed). Encoder discipline (per user memory 'pdx encoder pitfalls'): no `test rN, rN` (every check is `cmp rN, 0`); no 2-op `imul` (only `div` by the compile-time constants 10 and 1000000); no `and r8-r15, imm64` (no `and` at all); byte stores via `mov_b [ptr], reg`; every label prefixed `ping_`; module name matches file basename PascalCase (Main); every `[u8; N]` length computed with `python3 -c 'len(...)'`, not hand-counted.",
       block: {
         // ---- Step 0: latch argc / argv from execve-ABI registers. ----
         mov r12, rdi;                           // r12 = argc
@@ -125,18 +206,155 @@ module Main = structure {
         cmp r12, 2;
         jne ping_usage;
 
-        // ---- Step 2: four-iteration reply loop. ----------------------
-        mov r14, 0;                              // i = 0
-      ping_reply_loop:
+        // ---- Step 2: build the fixed dst IPv4 address (8.8.8.8). ----
+        // Honest WEAK stand-in for DNS resolution (see file header) --
+        // built at runtime via mov_b rather than embedded as a raw-byte
+        // string literal, keeping the source text printable/diffable.
+        lea rbx, [rip + ping_dst_ip];
+        mov rax, 8;
+        mov_b [rbx + 0], rax;
+        mov_b [rbx + 1], rax;
+        mov_b [rbx + 2], rax;
+        mov_b [rbx + 3], rax;
+
+        // ---- Step 3: four-iteration real ICMP-echo attempt loop. ----
+        mov r14, 0;                              // attempt index i = 0
+      ping_attempt_loop:
         cmp r14, 4;
         je ping_done;
-        mov rdi, 1;                               // fd = stdout
-        lea rsi, [rip + ping_msg_reply];
-        mov rdx, 27;                                // ping_msg_reply_len
-        mov rax, 1;                                  // SC+ sys_write
+
+        // t1 = sys_clock_read_ns()
+        mov rax, 66;                              // SC+ sys_clock_read_ns
         syscall;
+        mov r12, rax;                              // r12 = t1
+
+        // sys_icmp_echo(dst_addr_ptr, seq, payload_ptr, payload_len, timeout_ms)
+        mov rdi, rbx;                              // dst_addr_ptr = &ping_dst_ip
+        mov rsi, r14;
+        add rsi, 1;                                 // seq = i + 1
+        lea rdx, [rip + ping_payload];
+        mov rcx, 8;                                  // payload_len (ping_payload_len)
+        mov r8, 1000;                                 // timeout_ms (accepted, unused)
+        mov rax, 103;                                  // SC+ sys_icmp_echo
+        syscall;
+        mov r13, rax;                                   // r13 = rtt_ns | -EPERM | -EINVAL
+
+        // t2 = sys_clock_read_ns()
+        mov rax, 66;
+        syscall;
+        mov rbp, rax;                                     // rbp = t2
+
+        mov r15, rbp;
+        sub r15, r12;                                       // r15 = attempt_ns = t2 - t1 (r12/rbp still live here)
+
+        // ---- Branch on r13 against the two -errno sentinels. -------
+        xor r9, r9;
+        sub r9, 1;                                            // r9 = -EPERM sentinel (-1)
+        cmp r13, r9;
+        je ping_attempt_eperm;
+
+        xor r9, r9;
+        sub r9, 22;                                             // r9 = -EINVAL sentinel (-22)
+        cmp r13, r9;
+        je ping_attempt_einval;
+        jmp ping_attempt_success;
+
+      ping_attempt_success:
+        mov rax, r13;                                             // rax = rtt_ns (read OLD r13 before repurposing it)
+        mov rcx, 1000000;
+        xor rdx, rdx;                                              // zero-extend rdx:rax for div
+        div rcx;                                                    // rax = rtt_ms, rdx = remainder (unused)
+        mov r15, rax;                                                // r15 = value to print (rtt_ms)
+        mov r13, 1;                                                   // r13 = fd (1, stdout) -- safe now
+        mov r12, 1;                                                   // r12 = suffix tag (1 = "ms\n")
+        lea rsi, [rip + ping_lit_reply_prefix];
+        mov rdx, 23;                                                   // ping_lit_reply_prefix_len
+        jmp ping_emit_prefix;
+
+      ping_attempt_eperm:
+        // r15 already holds attempt_ns; no reassignment needed.
+        mov r13, 2;                                              // r13 = fd (2, stderr)
+        mov r12, 2;                                                // r12 = suffix tag (2 = bare "\n")
+        lea rsi, [rip + ping_lit_eperm_prefix];
+        mov rdx, 42;                                                // ping_lit_eperm_prefix_len
+        jmp ping_emit_prefix;
+
+      ping_attempt_einval:
+        mov r13, 2;
+        mov r12, 2;
+        lea rsi, [rip + ping_lit_einval_prefix];
+        mov rdx, 34;                                                // ping_lit_einval_prefix_len
+        // fall through to ping_emit_prefix
+
+      ping_emit_prefix:
+        mov rdi, r13;                                                // fd
+        mov rax, 1;                                                   // sys_write
+        syscall;
+        jmp ping_emit_number;
+
+        // ---- Shared decimal-conversion + emit tail. -----------------
+        // Straight port of mount_record_print_decimal's div-by-10
+        // loop (tools/user/mount.pdxfs/src/mount_record.pdx), staged
+        // into ping_num_scratch. Value in r15, output fd in r13,
+        // suffix tag in r12 (1 = "ms\n", else bare "\n"). Every
+        // register used inside this block that is NOT r12/r13/r14/r15
+        // is pure syscall-free scratch, reloaded before each syscall.
+      ping_emit_number:
+        cmp r15, 0;
+        jne ping_emit_number_setup;
+
+        lea r8, [rip + ping_num_scratch];
+        mov rax, 0x30;                                                 // '0'
+        mov_b [r8 + 0], rax;
+        mov rdi, r13;
+        mov rsi, r8;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp ping_emit_suffix;
+
+      ping_emit_number_setup:
+        mov r9, r15;                                                    // remaining value (volatile scratch)
+        lea r8, [rip + ping_num_scratch];
+        add r8, 19;                                                      // cursor at last staging byte
+      ping_emit_number_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;                                                          // rax = quotient, rdx = remainder
+        add rdx, 0x30;                                                     // digit -> ASCII
+        mov_b [r8 + 0], rdx;
+        mov r9, rax;
+        cmp r9, 0;
+        je ping_emit_number_done;
+        sub r8, 1;
+        jmp ping_emit_number_loop;
+      ping_emit_number_done:
+        lea r10, [rip + ping_num_scratch];
+        add r10, 20;                                                        // one past last staging byte
+        mov rdx, r10;
+        sub rdx, r8;                                                         // digit count
+        mov rdi, r13;                                                         // fd
+        mov rsi, r8;                                                          // ptr = cursor
+        mov rax, 1;
+        syscall;
+
+      ping_emit_suffix:
+        cmp r12, 1;
+        je ping_emit_suffix_ms;
+        lea rsi, [rip + ping_lit_nl];
+        mov rdx, 1;                                                            // ping_lit_nl_len
+        jmp ping_emit_suffix_do;
+      ping_emit_suffix_ms:
+        lea rsi, [rip + ping_lit_reply_suffix];
+        mov rdx, 3;                                                             // ping_lit_reply_suffix_len
+      ping_emit_suffix_do:
+        mov rdi, r13;                                                            // fd
+        mov rax, 1;
+        syscall;
+
         add r14, 1;
-        jmp ping_reply_loop;
+        jmp ping_attempt_loop;
 
       ping_done:
         mov rdi, 0;

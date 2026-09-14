@@ -3,11 +3,18 @@
 **Wave:** R100 (user-space networking tools -- paideia-os
 `design/networking/r100-user-tools-plan.md`); tracker prefix R80
 (dispatch-wave label; see "Wave-label note" below).
-**Overall status:** **M1 CLOSED** (2026-09-13, `r80-closed`).
-`ping <host>` prints four `reply from 8.8.8.8 rtt=1ms` lines via two
-honest WEAK stubs (DNS resolve, ICMP echo) -- see the honest-scope
-statement below for why each is a stub for a different reason.
-**Version:** 0.5.0 (tag `v0.5.0`); round-closure tag `r80-closed`.
+**Overall status:** `ping <host>` prints up to four per-attempt reply
+lines. Wave mu-04 (paideia-os/ping#3) replaced the v0.5.0 fixed-RTT
+WEAK stub with a REAL `sys_icmp_echo` call (SC+ 103) bracketed by real
+`sys_clock_read_ns` reads -- the syscall's own `R_NET_PRIVILEGED_
+PROTOCOL` gate (PID 1 / boot only) means every real call from this
+ring-3 process observes `-EPERM` today, which the tool now reports
+honestly per attempt (`ping: icmp echo denied (EPERM)
+attempt_ns=<n>`) rather than papering over. DNS resolution remains a
+separate, unrelated WEAK stub (`libpdx-net.net_resolve` not yet
+linkable; every host resolves to `8.8.8.8`).
+**Version:** 1.0.0 (tag `v1.0.0`); prior tag `v0.5.0`, round-closure
+tag `r80-closed`.
 
 ## Wave-label note
 

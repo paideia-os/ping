@@ -20,19 +20,17 @@
 #                         tcsetattr needed.
 #
 # What is deliberately NOT declared here: no network-capability kind
-# at all. Both of this tool's network-shaped operations are honest
-# WEAK stubs at v0.5.0 (see README.md) -- DNS resolution never calls
-# `libpdx-net.net_resolve` (not yet linkable) and ICMP echo never
-# calls the kernel's real `sys_icmp_echo` (SC+ ID 103), because that
-# syscall's `R_NET_PRIVILEGED_PROTOCOL` gate
-# (src/kernel/core/cap/cap_net_privileged.pdx) admits only boot
-# context and PID 1 at this wave -- an ordinary ring-3 `ping` process
-# would get `-EPERM` on every real call regardless of any cap this
-# file could declare (the gate checks PID, not a capability slot).
-# When a real resolver and a real per-task ICMP grant exist, this file
-# grows the corresponding `KIND_*` entries; declaring them now would
-# claim access this tool cannot actually exercise, which the R100
-# wave's "declared for shape, not touched" convention still requires
-# to be truthful about what the code paths actually do.
+# at all -- STILL true as of v1.0.0 (Wave mu-04, ping#3), even though
+# `sys_icmp_echo` (SC+ ID 103) IS now really called on every attempt.
+# `R_NET_PRIVILEGED_PROTOCOL`
+# (src/kernel/core/cap/cap_net_privileged.pdx) is a PID-check gate
+# (boot context or PID 1 only), NOT a capability-table cap slot -- no
+# `KIND_*` entry this file could declare would change the outcome, so
+# declaring one would misrepresent this tool as holding an authority
+# the kernel gate does not consult at all. DNS resolution is still a
+# separate, unrelated WEAK stub (`libpdx-net.net_resolve` not yet
+# linkable). When a real per-task ICMP grant exists (a capability the
+# gate actually checks) and/or a real resolver lands, this file grows
+# the corresponding `KIND_*` entries.
 !KIND_USER               0x001   # invoker attribution (audit)
 !KIND_TTY                0x002   # write-only: reply lines to stdout
